@@ -27,40 +27,33 @@ def fetch_bitcoin_prices():
               (in milliseconds) and 'price'. Returns an empty list if an error occurs.
     """
     url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+    days_value = '5' # Standard value for this script
     params = {
         'vs_currency': 'usd',
-        'days': '5',
-        'interval': '15m'  # Attempting '15m' interval first
+        'days': days_value,
+        # No 'interval' key, API defaults to hourly for 'days' > 1
     }
+    logging.info(f"Attempting to fetch hourly Bitcoin price data for the last {days_value} days (default interval)...")
 
     try:
         response = requests.get(url, params=params)
         if response.status_code == 200:
             data = response.json()
             prices = data.get('prices', [])
+            if prices is None: # Handle cases where 'prices' key might exist but be None
+                logging.warning("API response successful, but 'prices' key is None.")
+                return []
             formatted_prices = [{'timestamp': item[0], 'price': item[1]} for item in prices]
-            logging.info(f"Successfully fetched {len(formatted_prices)} price points with interval '{params['interval']}'.")
+            logging.info(f"Successfully fetched {len(formatted_prices)} hourly price points for the last {days_value} days.")
             return formatted_prices
         else:
-            if params['interval'] == '15m':
-                logging.warning(f"Status code {response.status_code} with '15m' interval. Response: {response.text}")
-                logging.info("Retrying with 'hourly' interval...")
-                params['interval'] = 'hourly'
-                response = requests.get(url, params=params)
-                if response.status_code == 200:
-                    data = response.json()
-                    prices = data.get('prices', [])
-                    formatted_prices = [{'timestamp': item[0], 'price': item[1]} for item in prices]
-                    logging.info(f"Successfully fetched {len(formatted_prices)} price points with 'hourly' interval.")
-                    return formatted_prices
-                else:
-                    logging.error(f"Failed to fetch data with 'hourly' interval. Status code: {response.status_code}, Response: {response.text}")
-                    return []
-            else: # This case should ideally not be reached if 'hourly' is the final fallback
-                logging.error(f"Failed to fetch data. Status code: {response.status_code}, Response: {response.text}")
-                return []
+            logging.error(f"Failed to fetch data. Status code: {response.status_code}, Response: {response.text}")
+            return []
     except requests.exceptions.RequestException as e:
         logging.exception("RequestException occurred during API request:")
+        return []
+    except ValueError as e: # Specifically catch JSON parsing errors
+        logging.exception("ValueError (e.g., malformed JSON) occurred during API response processing:")
         return []
     except Exception as e: 
         logging.exception("An unexpected error occurred during fetch_bitcoin_prices:")

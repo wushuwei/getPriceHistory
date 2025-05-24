@@ -103,5 +103,7 @@ This will discover and run all tests in the `tests/` directory.
 *   Log messages are formatted to include a timestamp, log level, and the message content (e.g., `YYYY-MM-DD HH:MM:SS - INFO - Your message here`).
 
 ## API and Data Interval
-*   This script relies on the public CoinGecko API (specifically the `/coins/{id}/market_chart` endpoint).
-*   It initially requests data at 15-minute intervals for the last 5 days. However, the CoinGecko API may return data at coarser intervals (like hourly) when a longer time frame (such as 5 days) is requested with fine-grained intervals (like '15m'). The script is designed to attempt the '15m' interval first and then automatically retry with an 'hourly' interval if the initial request does not yield a successful response (e.g., due to API limitations on data points for the given range).
+
+This script uses the public [CoinGecko API](https_api.coingecko.com/api/v3/coins/bitcoin/market_chart) to fetch Bitcoin price data.
+
+For the requested 5-day data range, the CoinGecko API's free tier automatically provides data at **hourly intervals**. The script has been updated to reflect this and no longer attempts to specify '15m' or other explicit intervals that may require a paid API plan. It relies on the default granularity provided by the API for the 'days' parameter (which is hourly when 'days' is between 2 and 90).
