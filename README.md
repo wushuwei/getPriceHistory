@@ -71,6 +71,31 @@ python bitcoin_tracker.py
 ```
 The script will fetch the data and attempt to store it in your configured MongoDB database.
 
+## Testing
+
+This project uses `pytest` for unit testing. The tests are located in the `tests/` directory.
+
+**1. Install test dependencies:**
+
+If you haven't already installed all dependencies (which include testing libraries), run:
+
+```bash
+pip install -r requirements.txt
+```
+
+**2. Run tests:**
+
+To run the unit tests, navigate to the root directory of the project and execute the following command:
+
+```bash
+python -m pytest
+```
+Alternatively, you can often just run:
+```bash
+pytest
+```
+This will discover and run all tests in the `tests/` directory.
+
 ## Logging
 *   The script uses Python's built-in `logging` module for output.
 *   Informational messages, errors, and warnings will be printed to the console.
