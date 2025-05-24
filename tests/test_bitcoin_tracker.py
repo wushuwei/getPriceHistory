@@ -15,9 +15,9 @@ import pymongo # For pymongo.errors # noqa E402
 from pymongo.results import UpdateResult # To mock the result of update_one # noqa E402
 
 # ---------- Tests for fetch_bitcoin_prices ----------
-# Test case 1: Successful API response (15m interval)
+# Test case 1: Successful API response (default interval, typically hourly for 5 days)
 @patch('bitcoin_tracker.requests.get')
-def test_fetch_successful_15m(mock_get):
+def test_fetch_successful_default_interval(mock_get):
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = {'prices': [[1609459200000, 30000], [1609460100000, 30100]]}
@@ -27,51 +27,16 @@ def test_fetch_successful_15m(mock_get):
     result = fetch_bitcoin_prices()
 
     assert result == expected_data
-    # Check that requests.get was called with '15m' interval
+    mock_get.assert_called_once() # Ensure only one call is made
     args, kwargs = mock_get.call_args
     assert 'params' in kwargs
-    assert kwargs['params']['interval'] == '15m'
-    assert kwargs['params']['days'] == '5' # Ensure other default params are there
+    # Ensure 'interval' is NOT in params, and 'days' is '5'
+    assert 'interval' not in kwargs['params']
+    assert kwargs['params']['days'] == '5'
+    assert kwargs['params']['vs_currency'] == 'usd'
 
-# Test case 2: Successful API response (hourly interval after 15m fails)
-@patch('bitcoin_tracker.requests.get')
-def test_fetch_successful_hourly_after_15m_fails(mock_get):
-    # Define the side effect function
-    def side_effect_15m_fail_hourly_ok(*args, **kwargs):
-        params = kwargs.get('params', {})
-        if params.get('interval') == '15m':
-            error_response = MagicMock()
-            error_response.status_code = 400  # Simulate an API error for 15m
-            error_response.json.return_value = {"error": "Interval too granular for this range"}
-            error_response.text = '{"error": "Interval too granular for this range"}' # for logging
-            return error_response
-        elif params.get('interval') == 'hourly':
-            success_response = MagicMock()
-            success_response.status_code = 200
-            success_response.json.return_value = {'prices': [[1609459200000, 29000]]}
-            return success_response
-        # Fallback, should not be reached in a well-defined test
-        fallback_response = MagicMock()
-        fallback_response.status_code = 500 
-        return fallback_response
 
-    mock_get.side_effect = side_effect_15m_fail_hourly_ok
-    
-    expected_data = [{'timestamp': 1609459200000, 'price': 29000}]
-    result = fetch_bitcoin_prices()
-
-    assert result == expected_data
-    assert mock_get.call_count == 2
-    
-    # Check params for the first call (15m)
-    args_15m, kwargs_15m = mock_get.call_args_list[0]
-    assert kwargs_15m['params']['interval'] == '15m'
-    
-    # Check params for the second call (hourly)
-    args_hourly, kwargs_hourly = mock_get.call_args_list[1]
-    assert kwargs_hourly['params']['interval'] == 'hourly'
-
-# Test case 3: API error (e.g., status code 500)
+# Test case 2: API error (e.g., status code 500)
 @patch('bitcoin_tracker.requests.get')
 def test_fetch_api_error_500(mock_get):
     mock_response = MagicMock()
@@ -81,21 +46,19 @@ def test_fetch_api_error_500(mock_get):
 
     result = fetch_bitcoin_prices()
     assert result == []
-    # The function should try 15m, fail, then try hourly, fail again
-    assert mock_get.call_count == 2 
+    mock_get.assert_called_once() # Only one call attempt
 
 
-# Test case 4: Network error (requests.exceptions.RequestException)
+# Test case 3: Network error (requests.exceptions.RequestException)
 @patch('bitcoin_tracker.requests.get')
 def test_fetch_network_error(mock_get):
     mock_get.side_effect = requests.exceptions.RequestException("Network error")
 
     result = fetch_bitcoin_prices()
     assert result == []
-    # Network error on first attempt, so only one call
-    assert mock_get.call_count == 1
+    mock_get.assert_called_once() # Only one call attempt
 
-# Test case 5: Malformed JSON response
+# Test case 4: Malformed JSON response (ValueError during .json())
 @patch('bitcoin_tracker.requests.get')
 def test_fetch_malformed_json(mock_get):
     mock_response = MagicMock()
@@ -106,10 +69,9 @@ def test_fetch_malformed_json(mock_get):
 
     result = fetch_bitcoin_prices()
     assert result == []
-    # Malformed JSON on first attempt, so only one call
-    assert mock_get.call_count == 1
+    mock_get.assert_called_once()
 
-# Test case 6: Empty prices list in successful response
+# Test case 5: Empty prices list in successful response
 @patch('bitcoin_tracker.requests.get')
 def test_fetch_successful_empty_prices(mock_get):
     mock_response = MagicMock()
@@ -121,9 +83,23 @@ def test_fetch_successful_empty_prices(mock_get):
     assert result == [] # Expect an empty list if API returns no price points
     mock_get.assert_called_once()
     args, kwargs = mock_get.call_args
-    assert kwargs['params']['interval'] == '15m'
+    assert 'interval' not in kwargs['params'] # Check no interval param
 
-# Test case for when the API returns data but the 'prices' key is missing.
+# Test case 6: 'prices' key is present but None
+@patch('bitcoin_tracker.requests.get')
+def test_fetch_prices_key_is_none(mock_get):
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {'prices': None} # 'prices' key exists but is None
+    mock_get.return_value = mock_response
+
+    result = fetch_bitcoin_prices()
+    assert result == []
+    mock_get.assert_called_once()
+    args, kwargs = mock_get.call_args
+    assert 'interval' not in kwargs['params']
+
+# Test case 7: 'prices' key is missing in successful response
 @patch('bitcoin_tracker.requests.get')
 def test_fetch_missing_prices_key(mock_get):
     mock_response = MagicMock()
@@ -135,50 +111,32 @@ def test_fetch_missing_prices_key(mock_get):
     assert result == []
     mock_get.assert_called_once()
     args, kwargs = mock_get.call_args
-    assert kwargs['params']['interval'] == '15m'
+    assert 'interval' not in kwargs['params']
 
-# Test case for when the API returns non-200 for hourly fallback as well
-@patch('bitcoin_tracker.requests.get')
-def test_fetch_hourly_fallback_also_fails(mock_get):
-    error_response_15m = MagicMock()
-    error_response_15m.status_code = 400
-    error_response_15m.text = "Error 15m"
 
-    error_response_hourly = MagicMock()
-    error_response_hourly.status_code = 403
-    error_response_hourly.text = "Error hourly"
-    
-    mock_get.side_effect = [error_response_15m, error_response_hourly]
-
-    result = fetch_bitcoin_prices()
-    assert result == []
-    assert mock_get.call_count == 2
-    assert mock_get.call_args_list[0][1]['params']['interval'] == '15m'
-    assert mock_get.call_args_list[1][1]['params']['interval'] == 'hourly'
-
-# Test case for unexpected exception during requests.get()
+# Test case 8: Unexpected exception during requests.get()
 @patch('bitcoin_tracker.requests.get')
 def test_fetch_unexpected_exception_on_get(mock_get):
     mock_get.side_effect = Exception("Something totally unexpected")
 
     result = fetch_bitcoin_prices()
     assert result == []
-    assert mock_get.call_count == 1 # Fails on the first '15m' attempt
+    mock_get.assert_called_once()
     
-# Test case for unexpected exception during response.json()
+# Test case 9: Unexpected exception during response.json() (other than ValueError)
 @patch('bitcoin_tracker.requests.get')
 def test_fetch_unexpected_exception_on_json_parse(mock_get):
     mock_response = MagicMock()
     mock_response.status_code = 200
-    mock_response.json.side_effect = Exception("Unexpected JSON parsing error")
+    mock_response.json.side_effect = Exception("Unexpected JSON parsing error") # Not ValueError
     mock_get.return_value = mock_response
 
     result = fetch_bitcoin_prices()
     assert result == []
-    assert mock_get.call_count == 1
+    mock_get.assert_called_once()
 
-# Test case for unexpected exception after a successful 15m API call but before formatting
-# (e.g., data.get('prices', []) fails if data is not a dict)
+# Test case 10: Unexpected exception after a successful API call but during data processing
+# (e.g., data.get('prices', []) fails if data is not a dict, or list comprehension fails)
 @patch('bitcoin_tracker.requests.get')
 def test_fetch_unexpected_exception_post_successful_call(mock_get):
     mock_response = MagicMock()
@@ -189,7 +147,7 @@ def test_fetch_unexpected_exception_post_successful_call(mock_get):
 
     result = fetch_bitcoin_prices()
     assert result == []
-    assert mock_get.call_count == 1
+    mock_get.assert_called_once()
 
 # ---------- Tests for connect_to_mongodb ----------
 
