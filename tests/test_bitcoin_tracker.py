@@ -403,110 +403,239 @@ def test_insert_unexpected_exception():
 
 # ---------- Tests for fetch_bitcoin_prices_coinbase ----------
 
+@patch('bitcoin_tracker.datetime')
 @patch('bitcoin_tracker.requests.get')
-def test_fetch_coinbase_successful(mock_get, mocker):
-    mock_response = mocker.Mock() # Use mocker fixture for consistency
-    mock_response.status_code = 200
-    # Coinbase format: [time_epoch_sec, low, high, open, close, volume]
-    mock_response.json.return_value = [
-        [1678886400, 24000, 24100, 24050, 24080.50, 10], # 2023-03-15T12:00:00Z
-        [1678887300, 24080, 24200, 24080, 24150.75, 12]  # 2023-03-15T12:15:00Z
-    ]
-    mock_get.return_value = mock_response
+def test_fetch_coinbase_successful_default_pagination(mock_requests_get, mock_datetime, mocker, caplog):
+    # --- Setup for predictable time ---
+    # Fixed current time for predictable chunk calculations
+    fixed_now_utc = datetime(2023, 3, 15, 12, 0, 0, tzinfo=timezone.utc) # Example: 12:00 PM UTC
+    mock_datetime.now.return_value = fixed_now_utc
+    mock_datetime.side_effect = lambda *args, **kw: datetime(*args, **kw) # Allow datetime constructors
 
-    # Clear any preset env vars for this test
-    mocker.patch.dict(os.environ, clear=True)
+    # --- Configuration ---
+    mocker.patch.dict(os.environ, clear=True) # Use default granularity (60s)
+    granularity = 60
+    product_id = "BTC-USD"
+    max_candles_per_request = 300
+    total_duration_hours = 48
+    
+    # Total candles: 48 hours * 60 min/hr * 1 candle/min (for 60s granularity) = 2880 candles
+    # Number of requests: 2880 / 300 = 9.6 => 10 requests
+    expected_num_calls = (total_duration_hours * 3600 // granularity) // max_candles_per_request + \
+                         (1 if (total_duration_hours * 3600 // granularity) % max_candles_per_request > 0 else 0)
 
-    result = fetch_bitcoin_prices_coinbase()
+    # --- Mock API Responses ---
+    mock_responses = []
+    all_expected_data_points = []
+    
+    overall_start_time_utc = fixed_now_utc - timedelta(hours=total_duration_hours)
 
-    expected_data = [
-        {'timestamp': 1678886400000, 'price': 24080.50},
-        {'timestamp': 1678887300000, 'price': 24150.75}
-    ]
-    assert result == expected_data
-    mock_get.assert_called_once()
-    args, kwargs = mock_get.call_args
-    assert "https://api.pro.coinbase.com/products/BTC-USD/candles" in args[0]
-    assert kwargs['params']['granularity'] == 900 # Default
+    for i in range(expected_num_calls):
+        response = mocker.Mock()
+        response.status_code = 200
+        
+        # Generate data for this chunk
+        chunk_data = []
+        # Calculate start time for this specific chunk based on overall_start_time_utc and how many candles processed so far
+        candles_processed_so_far = i * max_candles_per_request
+        chunk_base_time_sec = int((overall_start_time_utc + timedelta(seconds=candles_processed_so_far * granularity)).timestamp())
+
+        num_candles_in_chunk = max_candles_per_request
+        if i == expected_num_calls -1: # Last chunk might have fewer candles
+            remaining_candles = (total_duration_hours * 3600 // granularity) - candles_processed_so_far
+            if remaining_candles > 0:
+                 num_candles_in_chunk = remaining_candles
+            else: # Should not happen if expected_num_calls is correct
+                 mock_responses.append(response) # Add empty if calculation was off
+                 continue
+
+
+        for j in range(num_candles_in_chunk):
+            candle_time_sec = chunk_base_time_sec + j * granularity
+            price = 20000 + i * 100 + j  # Unique price for each candle
+            # Coinbase format: [time_epoch_sec, low, high, open, close, volume]
+            candle = [candle_time_sec, price - 10, price + 10, price - 5, price, 1.0]
+            chunk_data.append(candle)
+            all_expected_data_points.append({'timestamp': candle_time_sec * 1000, 'price': float(price)})
+        
+        response.json.return_value = chunk_data
+        mock_responses.append(response)
+
+    mock_requests_get.side_effect = mock_responses
+
+    # --- Execute ---
+    with caplog.at_level(logging.INFO):
+        result = fetch_bitcoin_prices_coinbase()
+
+    # --- Assertions ---
+    assert len(result) == len(all_expected_data_points)
+    assert result == all_expected_data_points # Assumes data is sorted by the function
+    
+    assert mock_requests_get.call_count == expected_num_calls
+    
+    # Check params for each call
+    current_assert_start_time = overall_start_time_utc
+    for i in range(expected_num_calls):
+        args, kwargs = mock_requests_get.call_args_list[i]
+        assert f"https://api.exchange.coinbase.com/products/{product_id}/candles" in args[0]
+        assert kwargs['params']['granularity'] == granularity
+        
+        expected_chunk_end_time = min(current_assert_start_time + timedelta(seconds=max_candles_per_request * granularity), fixed_now_utc)
+        
+        assert kwargs['params']['start'] == current_assert_start_time.isoformat().replace(".000000", "")
+        assert kwargs['params']['end'] == expected_chunk_end_time.isoformat().replace(".000000", "")
+        
+        current_assert_start_time = expected_chunk_end_time
+
+    assert f"Attempting to fetch Coinbase Exchange API data for product ID '{product_id}'" in caplog.text
+    assert f"Successfully fetched a total of {len(all_expected_data_points)} price points" in caplog.text
 
 @patch('bitcoin_tracker.requests.get')
-def test_fetch_coinbase_api_error(mock_get, mocker, caplog):
+def test_fetch_coinbase_api_error_first_chunk(mock_get, mocker, caplog):
+    # Test error on the very first chunk
     mock_response = mocker.Mock()
     mock_response.status_code = 500
-    mock_response.text = "Coinbase Server Error"
-    mock_get.return_value = mock_response
+    mock_response.text = "Coinbase Server Error on first chunk"
+    mock_get.return_value = mock_response # Fails on first call
+    mocker.patch.dict(os.environ, clear=True) # Defaults: BTC-USD, 60s
+
+    with caplog.at_level(logging.ERROR):
+        result = fetch_bitcoin_prices_coinbase()
+    
+    assert result == []
+    assert "Failed to fetch data for chunk 1 (product ID 'BTC-USD') from Coinbase Exchange API." in caplog.text
+    assert "Status code: 500, Response: Coinbase Server Error on first chunk" in caplog.text
+    mock_get.assert_called_once() # Should stop after first failed chunk
+
+@patch('bitcoin_tracker.datetime')
+@patch('bitcoin_tracker.requests.get')
+def test_fetch_coinbase_error_during_pagination(mock_requests_get, mock_datetime_now, mocker, caplog):
+    fixed_now_utc = datetime(2023, 3, 15, 12, 0, 0, tzinfo=timezone.utc)
+    mock_datetime_now.now.return_value = fixed_now_utc
+    mock_datetime_now.side_effect = lambda *args, **kw: datetime(*args, **kw)
+
+    mocker.patch.dict(os.environ, {"COINBASE_GRANULARITY_SECONDS": "18000"}) # Approx 1 chunk for 48h if 300 limit
+                                                                            # No, 48h = 172800s. 172800/18000 = 9.6 candles. 1 chunk.
+                                                                            # Let's use 3600s (1hr) for 48 candles, requiring 1 chunk.
+                                                                            # To force 2 chunks: 48h * 3600s/h = 172800s. Granularity X. Candles = 172800/X.
+                                                                            # If X=900 (15min), candles = 192. (1 chunk)
+                                                                            # If X=60 (1min), candles = 2880. (10 chunks)
+                                                                            # Let's use 60s for multiple chunks.
+    mocker.patch.dict(os.environ, {"COINBASE_GRANULARITY_SECONDS": "60"})
+
+
+    # First response successful (e.g. 300 candles)
+    successful_response = mocker.Mock()
+    successful_response.status_code = 200
+    first_chunk_data = [[int((fixed_now_utc - timedelta(hours=48) + timedelta(seconds=i*60)).timestamp()), 20000, 20000, 20000, 20000+i, 1] for i in range(300)]
+    successful_response.json.return_value = first_chunk_data
+    
+    # Second response is an error
+    error_response = mocker.Mock()
+    error_response.status_code = 500
+    error_response.text = "Coinbase Server Error on second chunk"
+
+    mock_requests_get.side_effect = [successful_response, error_response]
+
+    with caplog.at_level(logging.INFO): # Capture INFO for success messages too
+        result = fetch_bitcoin_prices_coinbase()
+
+    assert len(result) == 300 # Only data from the first chunk
+    assert result[0]['price'] == 20000
+    assert result[299]['price'] == 20000 + 299
+    
+    assert "Successfully fetched 300 price points for chunk 1." in caplog.text
+    assert "Failed to fetch data for chunk 2 (product ID 'BTC-USD') from Coinbase Exchange API." in caplog.text
+    assert "Status code: 500, Response: Coinbase Server Error on second chunk" in caplog.text
+    assert mock_requests_get.call_count == 2
+
+
+@patch('bitcoin_tracker.requests.get')
+def test_fetch_coinbase_request_exception_first_chunk(mock_get, mocker, caplog):
+    mock_get.side_effect = requests.exceptions.RequestException("Coinbase network error on first chunk")
+    mocker.patch.dict(os.environ, clear=True) # Defaults: BTC-USD, 60s
+
+    with caplog.at_level(logging.ERROR):
+        result = fetch_bitcoin_prices_coinbase()
+
+    assert result == []
+    assert "RequestException occurred during Coinbase Exchange API request for chunk 1 (product ID 'BTC-USD')" in caplog.text
+    mock_get.assert_called_once()
+
+@patch('bitcoin_tracker.requests.get')
+def test_fetch_coinbase_timeout_exception_first_chunk(mock_get, mocker, caplog):
+    mock_get.side_effect = requests.exceptions.Timeout("Coinbase timeout on first chunk")
     mocker.patch.dict(os.environ, clear=True)
 
     with caplog.at_level(logging.ERROR):
         result = fetch_bitcoin_prices_coinbase()
     
     assert result == []
-    assert "Failed to fetch data for product ID 'BTC-USD' from Coinbase Pro." in caplog.text
-    assert "Status code: 500, Response: Coinbase Server Error" in caplog.text
+    assert "Timeout occurred during Coinbase Exchange API request for chunk 1 (product ID 'BTC-USD')" in caplog.text
+    mock_get.assert_called_once()
 
 @patch('bitcoin_tracker.requests.get')
-def test_fetch_coinbase_request_exception(mock_get, mocker, caplog):
-    mock_get.side_effect = requests.exceptions.RequestException("Coinbase network error")
-    mocker.patch.dict(os.environ, clear=True)
-
-    with caplog.at_level(logging.ERROR): # logging.exception logs at ERROR level
-        result = fetch_bitcoin_prices_coinbase()
-
-    assert result == []
-    assert "RequestException occurred during Coinbase API request for product ID 'BTC-USD'" in caplog.text
-
-@patch('bitcoin_tracker.requests.get')
-def test_fetch_coinbase_timeout_exception(mock_get, mocker, caplog):
-    mock_get.side_effect = requests.exceptions.Timeout("Coinbase timeout")
+def test_fetch_coinbase_malformed_json_first_chunk(mock_get, mocker, caplog):
+    mock_response = mocker.Mock()
+    mock_response.status_code = 200
+    mock_response.json.side_effect = ValueError("Bad JSON from Coinbase on first chunk")
+    mock_get.return_value = mock_response
     mocker.patch.dict(os.environ, clear=True)
 
     with caplog.at_level(logging.ERROR):
         result = fetch_bitcoin_prices_coinbase()
+
+    assert result == []
+    assert "ValueError (e.g., malformed JSON) for chunk 1 (product ID 'BTC-USD') from Coinbase Exchange API" in caplog.text
+    mock_get.assert_called_once()
+
+@patch('bitcoin_tracker.datetime')
+@patch('bitcoin_tracker.requests.get')
+def test_fetch_coinbase_empty_data_all_chunks(mock_requests_get, mock_datetime_now, mocker, caplog):
+    fixed_now_utc = datetime(2023, 3, 15, 12, 0, 0, tzinfo=timezone.utc)
+    mock_datetime_now.now.return_value = fixed_now_utc
+    mock_datetime_now.side_effect = lambda *args, **kw: datetime(*args, **kw)
     
-    assert result == []
-    assert "Timeout occurred during Coinbase API request for product ID 'BTC-USD'" in caplog.text
+    mocker.patch.dict(os.environ, clear=True) # Defaults BTC-USD, 60s granularity
+    granularity = 60
+    expected_num_calls = (48 * 3600 // granularity) // 300 + \
+                         (1 if (48 * 3600 // granularity) % 300 > 0 else 0)
 
-@patch('bitcoin_tracker.requests.get')
-def test_fetch_coinbase_malformed_json(mock_get, mocker, caplog):
-    mock_response = mocker.Mock()
-    mock_response.status_code = 200
-    mock_response.json.side_effect = ValueError("Bad JSON from Coinbase")
-    mock_get.return_value = mock_response
-    mocker.patch.dict(os.environ, clear=True)
-
-    with caplog.at_level(logging.ERROR):
-        result = fetch_bitcoin_prices_coinbase()
-
-    assert result == []
-    assert "ValueError (e.g., malformed JSON) occurred during Coinbase API response processing for product ID 'BTC-USD'" in caplog.text
-
-@patch('bitcoin_tracker.requests.get')
-def test_fetch_coinbase_empty_data_list(mock_get, mocker, caplog):
-    mock_response = mocker.Mock()
-    mock_response.status_code = 200
-    mock_response.json.return_value = [] # Empty list from API
-    mock_get.return_value = mock_response
-    mocker.patch.dict(os.environ, clear=True)
+    mock_empty_responses = []
+    for _ in range(expected_num_calls):
+        response = mocker.Mock()
+        response.status_code = 200
+        response.json.return_value = [] # Empty list for each chunk
+        mock_empty_responses.append(response)
+    
+    mock_requests_get.side_effect = mock_empty_responses
 
     with caplog.at_level(logging.INFO):
         result = fetch_bitcoin_prices_coinbase()
 
     assert result == []
-    assert "Coinbase API returned no data for the requested range." in caplog.text
+    assert mock_requests_get.call_count == expected_num_calls
+    for i in range(expected_num_calls):
+        assert f"Coinbase Exchange API returned no data for chunk {i+1}" in caplog.text
+    assert "No data fetched for product ID 'BTC-USD' from Coinbase Exchange API after attempting all chunks." in caplog.text
 
 
 @patch('bitcoin_tracker.requests.get')
-def test_fetch_coinbase_malformed_candle_data(mock_get, mocker, caplog):
+def test_fetch_coinbase_malformed_candle_data_single_chunk(mock_get, mocker, caplog):
+    # This test focuses on malformed data within one chunk, pagination complexity is secondary.
     mock_response = mocker.Mock()
     mock_response.status_code = 200
-    # Valid candle, then malformed (too few elements), then another valid one
     mock_response.json.return_value = [
         [1678886400, 24000, 24100, 24050, 24080.50, 10],
         [1678887300, 24150.75], # Malformed
         [1678888200, 24200, 24300, 24250, 24280.00, 15]
     ]
+    # Simulate only one call needed by making granularity large enough for 48h in one chunk
+    # 48 hours * 3600s/hr = 172800s. If granularity is 172800, 1 candle.
+    # Max 300 candles. So 172800/300 = 576s minimum granularity for 1 chunk.
+    mocker.patch.dict(os.environ, {"COINBASE_GRANULARITY_SECONDS": "900"}) # 15 min, 192 candles, 1 chunk
     mock_get.return_value = mock_response
-    mocker.patch.dict(os.environ, clear=True)
+
 
     with caplog.at_level(logging.WARNING):
         result = fetch_bitcoin_prices_coinbase()
@@ -516,47 +645,78 @@ def test_fetch_coinbase_malformed_candle_data(mock_get, mocker, caplog):
         {'timestamp': 1678888200000, 'price': 24280.00}
     ]
     assert result == expected_data
-    assert "Skipping malformed candle data: [1678887300, 24150.75]" in caplog.text
+    assert "Skipping malformed candle data in chunk 1: [1678887300, 24150.75]" in caplog.text
     assert len(result) == 2
+    mock_get.assert_called_once() # Ensure it was indeed one chunk
+    args, kwargs = mock_get.call_args
+    assert "https://api.exchange.coinbase.com/products/BTC-USD/candles" in args[0]
 
 
+@patch('bitcoin_tracker.datetime')
 @patch('bitcoin_tracker.requests.get')
-def test_fetch_coinbase_invalid_granularity_env(mock_get, mocker, caplog):
-    # Set invalid granularity, mock_get will be used to check params
-    mocker.patch.dict(os.environ, {"COINBASE_GRANULARITY_SECONDS": "xyz"})
+def test_fetch_coinbase_invalid_granularity_env_pagination(mock_requests_get, mock_datetime_now, mocker, caplog):
+    fixed_now_utc = datetime(2023, 3, 15, 12, 0, 0, tzinfo=timezone.utc)
+    mock_datetime_now.now.return_value = fixed_now_utc
+    mock_datetime_now.side_effect = lambda *args, **kw: datetime(*args, **kw)
+
+    mocker.patch.dict(os.environ, {"COINBASE_GRANULARITY_SECONDS": "xyzINVALID"})
     
-    # Mock a successful response to allow the function to proceed to the requests.get call
-    mock_api_response = mocker.Mock()
-    mock_api_response.status_code = 200
-    mock_api_response.json.return_value = [[1678886400, 1, 1, 1, 1, 1]] # Dummy data
-    mock_get.return_value = mock_api_response
+    # Expect default granularity of 60s, so multiple calls
+    default_granularity = 60
+    expected_num_calls = (48 * 3600 // default_granularity) // 300 + \
+                         (1 if (48 * 3600 // default_granularity) % 300 > 0 else 0)
+
+    mock_responses = []
+    for i in range(expected_num_calls):
+        response = mocker.Mock()
+        response.status_code = 200
+        # Minimal data for each chunk to make it pass through processing
+        response.json.return_value = [[int((fixed_now_utc - timedelta(hours=48) + timedelta(seconds=i*300*default_granularity)).timestamp()), 1,1,1,1,1]]
+        mock_responses.append(response)
+    mock_requests_get.side_effect = mock_responses
 
     with caplog.at_level(logging.WARNING):
         fetch_bitcoin_prices_coinbase()
 
-    assert "Invalid value 'xyz' for COINBASE_GRANULARITY_SECONDS. Must be an integer. Using default: 900 seconds." in caplog.text
-    mock_get.assert_called_once()
-    args, kwargs = mock_get.call_args
-    assert kwargs['params']['granularity'] == 900 # Default granularity
+    assert "Invalid value 'xyzINVALID' for COINBASE_GRANULARITY_SECONDS. Must be an integer. Using default: 60 seconds." in caplog.text
+    assert mock_requests_get.call_count == expected_num_calls
+    args, kwargs = mock_requests_get.call_args_list[0] # Check first call
+    assert kwargs['params']['granularity'] == default_granularity # New default 60s
+    assert "https://api.exchange.coinbase.com/products/BTC-USD/candles" in args[0]
 
+
+@patch('bitcoin_tracker.datetime')
 @patch('bitcoin_tracker.requests.get')
-def test_fetch_coinbase_configurable_product_id_and_granularity(mock_get, mocker):
+def test_fetch_coinbase_configurable_product_id_and_granularity_pagination(mock_requests_get, mock_datetime_now, mocker, caplog):
+    fixed_now_utc = datetime(2023, 3, 15, 12, 0, 0, tzinfo=timezone.utc)
+    mock_datetime_now.now.return_value = fixed_now_utc
+    mock_datetime_now.side_effect = lambda *args, **kw: datetime(*args, **kw)
+
+    custom_product_id = "ETH-USD"
+    custom_granularity = 900 # 15 minutes
     mocker.patch.dict(os.environ, {
-        "COINBASE_PRODUCT_ID": "ETH-USD",
-        "COINBASE_GRANULARITY_SECONDS": "300"
+        "COINBASE_PRODUCT_ID": custom_product_id,
+        "COINBASE_GRANULARITY_SECONDS": str(custom_granularity)
     })
+
+    # For 48 hours at 900s granularity: 48 * 3600 / 900 = 192 candles. This fits in ONE request.
+    expected_num_calls = 1 
 
     mock_api_response = mocker.Mock()
     mock_api_response.status_code = 200
-    mock_api_response.json.return_value = [[1678886400, 1, 1, 1, 1, 1]] # Dummy data
-    mock_get.return_value = mock_api_response
+    # One candle for simplicity, the focus is on params and call count
+    mock_api_response.json.return_value = [[int((fixed_now_utc - timedelta(hours=48)).timestamp()), 1500,1500,1500,1500,2]] 
+    mock_requests_get.return_value = mock_api_response # Single response, not side_effect list
     
-    fetch_bitcoin_prices_coinbase()
+    with caplog.at_level(logging.INFO):
+      fetch_bitcoin_prices_coinbase()
 
-    mock_get.assert_called_once()
-    args, kwargs = mock_get.call_args
-    assert "https://api.pro.coinbase.com/products/ETH-USD/candles" in args[0]
-    assert kwargs['params']['granularity'] == 300
+    assert mock_requests_get.call_count == expected_num_calls
+    args, kwargs = mock_requests_get.call_args_list[0]
+    assert f"https://api.exchange.coinbase.com/products/{custom_product_id}/candles" in args[0]
+    assert kwargs['params']['granularity'] == custom_granularity
+    assert f"product ID '{custom_product_id}'" in caplog.text
+    assert f"granularity {custom_granularity} seconds" in caplog.text
 
 # ---------- Tests for Concurrent Fetching Logic (Simulated __main__) ----------
 
