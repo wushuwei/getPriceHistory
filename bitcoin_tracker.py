@@ -76,95 +76,140 @@ def fetch_bitcoin_prices_coinbase():
     product_id = os.getenv('COINBASE_PRODUCT_ID', default_product_id)
 
     # Configuration for Granularity
-    default_granularity_seconds = 900  # 15 minutes
+    default_granularity_seconds = 60  # New default: 1 minute
     granularity_env = os.getenv('COINBASE_GRANULARITY_SECONDS')
     granularity = default_granularity_seconds
 
     if granularity_env:
         try:
             granularity_int = int(granularity_env)
-            # Coinbase Pro API has specific allowed granularities: 60, 300, 900, 3600, 21600, 86400
-            # For this example, we'll allow any integer, but in a real scenario, validation against allowed values would be good.
+            # Coinbase Exchange API allowed granularities:
+            # UNKNOWN_GRANULARITY, ONE_MINUTE, FIVE_MINUTE, FIFTEEN_MINUTE, THIRTY_MINUTE, ONE_HOUR, TWO_HOUR, SIX_HOUR, ONE_DAY
+            # Corresponding seconds: N/A, 60, 300, 900, 1800, 3600, 7200, 21600, 86400
+            # We'll allow any integer for now, but validation against these specific values would be more robust.
             granularity = granularity_int
+            logging.info(f"Using COINBASE_GRANULARITY_SECONDS from environment: {granularity}s.")
         except ValueError:
             logging.warning(
                 f"Invalid value '{granularity_env}' for COINBASE_GRANULARITY_SECONDS. "
                 f"Must be an integer. Using default: {default_granularity_seconds} seconds."
             )
-    
-    url = f"https://api.pro.coinbase.com/products/{product_id}/candles"
-    
-    # Calculate start and end times for the API request (last 48 hours)
-    # Coinbase API expects ISO 8601 format for start and end times.
-    # It's crucial these are in UTC.
-    end_time = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(hours=48)
+    else:
+        logging.info(f"COINBASE_GRANULARITY_SECONDS not set. Using default: {default_granularity_seconds} seconds.")
 
-    # Format times for the API
-    start_iso = start_time.isoformat().replace('+00:00', 'Z') 
-    end_iso = end_time.isoformat().replace('+00:00', 'Z')
+    # New API endpoint
+    base_url = "https://api.exchange.coinbase.com"
+    url = f"{base_url}/products/{product_id}/candles"
+    
+    all_formatted_prices = []
+    
+    # Pagination logic
+    # Total duration to fetch: 48 hours
+    total_duration = timedelta(hours=48)
+    # Maximum candles per API request (Coinbase typically limits to 300)
+    max_candles_per_request = 300 
+    
+    # Calculate the overall start and end for the 48-hour window
+    overall_end_time_utc = datetime.now(timezone.utc)
+    overall_start_time_utc = overall_end_time_utc - total_duration
 
-    params = {
-        'granularity': granularity, # Use the configured or default granularity
-        'start': start_iso,
-        'end': end_iso
-    }
+    current_chunk_start_time = overall_start_time_utc
+    chunk_number = 0
 
     logging.info(
-        f"Attempting to fetch Coinbase Pro data for product ID '{product_id}' "
-        f"with granularity {granularity} seconds for the last 48 hours..."
+        f"Attempting to fetch Coinbase Exchange API data for product ID '{product_id}' "
+        f"with granularity {granularity} seconds for the last 48 hours."
     )
-    # The following log is more specific about the exact time window and granularity
-    logging.info(f"Requesting data from {start_iso} to {end_iso} with granularity {granularity}s for product '{product_id}'.")
+    logging.info(f"Total window: {overall_start_time_utc.isoformat()} to {overall_end_time_utc.isoformat()}")
 
-    all_formatted_prices = []
+    while current_chunk_start_time < overall_end_time_utc:
+        chunk_number += 1
+        # Calculate end time for the current chunk
+        # Fetch up to max_candles_per_request worth of data
+        potential_chunk_end_time = current_chunk_start_time + timedelta(seconds=max_candles_per_request * granularity)
+        current_chunk_end_time = min(potential_chunk_end_time, overall_end_time_utc)
 
-    try:
-        response = requests.get(url, params=params, timeout=10) # Added timeout
-        if response.status_code == 200:
-            data = response.json()
-            # Coinbase returns candles as: [time, low, high, open, close, volume]
-            # time is epoch seconds. We need to convert to milliseconds.
-            if not data:
-                logging.info("Coinbase API returned no data for the requested range.")
-                return []
+        start_iso = current_chunk_start_time.isoformat().replace(".%f", "") # Remove microseconds if any for cleaner ISO
+        end_iso = current_chunk_end_time.isoformat().replace(".%f", "")     # Remove microseconds
 
-            formatted_prices = []
-            for candle in data:
-                # Ensure candle has enough elements (at least 5 for time and close)
-                if len(candle) >= 5:
-                    timestamp_ms = int(candle[0]) * 1000  # Convert epoch seconds to milliseconds
-                    close_price = candle[4]
-                    formatted_prices.append({'timestamp': timestamp_ms, 'price': float(close_price)})
-                else:
-                    logging.warning(f"Skipping malformed candle data: {candle}")
-            
-            # Coinbase returns data in ascending order of time by default with start/end parameters.
-            # If it were descending, we might need to reverse: formatted_prices.reverse()
-            all_formatted_prices.extend(formatted_prices)
-            
-            logging.info(f"Successfully fetched {len(all_formatted_prices)} price points for product ID '{product_id}' from Coinbase Pro.")
-            return all_formatted_prices
-        else:
-            logging.error(
-                f"Failed to fetch data for product ID '{product_id}' from Coinbase Pro. "
-                f"Status code: {response.status_code}, Response: {response.text}"
-            )
-            return []
-    except requests.exceptions.Timeout as e:
-        logging.exception(f"Timeout occurred during Coinbase API request for product ID '{product_id}':")
-        return []
-    except requests.exceptions.RequestException as e:
-        logging.exception(f"RequestException occurred during Coinbase API request for product ID '{product_id}':")
-        return []
-    except ValueError as e:  # Specifically catch JSON parsing errors
-        logging.exception(
-            f"ValueError (e.g., malformed JSON) occurred during Coinbase API response processing for product ID '{product_id}':"
+        params = {
+            'granularity': granularity,
+            'start': start_iso,
+            'end': end_iso
+        }
+
+        logging.info(
+            f"Fetching chunk {chunk_number}: product ID '{product_id}', granularity {granularity}s, "
+            f"start: {start_iso}, end: {end_iso}"
         )
-        return []
-    except Exception as e:
-        logging.exception(f"An unexpected error occurred during fetch_bitcoin_prices_coinbase for product ID '{product_id}':")
-        return []
+
+        try:
+            response = requests.get(url, params=params, timeout=20) # Increased timeout for potentially larger requests
+            if response.status_code == 200:
+                data = response.json()
+                # Coinbase returns candles as: [time_epoch_sec, low, high, open, close, volume]
+                # time is epoch seconds. We need to convert to milliseconds.
+                if not data:
+                    logging.info(f"Coinbase Exchange API returned no data for chunk {chunk_number} in range {start_iso} to {end_iso}.")
+                    # If no data, and this isn't the absolute end, we might want to break or adjust.
+                    # For now, we continue to the next chunk.
+                    current_chunk_start_time = current_chunk_end_time 
+                    if current_chunk_start_time >= overall_end_time_utc and not all_formatted_prices:
+                         logging.warning(f"No data received for any chunk for product ID '{product_id}'.") # Warn if all chunks are empty
+                    continue
+
+
+                formatted_prices_chunk = []
+                for candle in data:
+                    if len(candle) >= 5: # time, low, high, open, close
+                        timestamp_ms = int(candle[0]) * 1000
+                        close_price = candle[4]
+                        formatted_prices_chunk.append({'timestamp': timestamp_ms, 'price': float(close_price)})
+                    else:
+                        logging.warning(f"Skipping malformed candle data in chunk {chunk_number}: {candle}")
+                
+                # Data from Coinbase /candles endpoint is typically returned in ascending order of time (oldest first).
+                # So, we can directly extend. If it were descending, we'd use `formatted_prices_chunk.reverse()` first.
+                all_formatted_prices.extend(formatted_prices_chunk)
+                logging.info(f"Successfully fetched {len(formatted_prices_chunk)} price points for chunk {chunk_number}.")
+
+            else:
+                logging.error(
+                    f"Failed to fetch data for chunk {chunk_number} (product ID '{product_id}') from Coinbase Exchange API. "
+                    f"Status code: {response.status_code}, Response: {response.text}"
+                )
+                # Optionally, break or implement retry logic here for robust fetching
+                break # Stop fetching if one chunk fails
+
+        except requests.exceptions.Timeout as e:
+            logging.exception(f"Timeout occurred during Coinbase Exchange API request for chunk {chunk_number} (product ID '{product_id}'):")
+            break 
+        except requests.exceptions.RequestException as e:
+            logging.exception(f"RequestException occurred during Coinbase Exchange API request for chunk {chunk_number} (product ID '{product_id}'):")
+            break
+        except ValueError as e:  # JSON parsing errors
+            logging.exception(
+                f"ValueError (e.g., malformed JSON) for chunk {chunk_number} (product ID '{product_id}') from Coinbase Exchange API:"
+            )
+            break
+        except Exception as e:
+            logging.exception(f"An unexpected error occurred during fetch for chunk {chunk_number} (product ID '{product_id}'):")
+            break # Stop on unexpected error
+
+        # Move to the next time window
+        current_chunk_start_time = current_chunk_end_time
+        
+        # Small delay to be polite to the API, especially if many chunks
+        # time.sleep(0.2) # Consider importing 'time' if using sleep
+
+    if all_formatted_prices:
+        # Sort by timestamp just in case chunks were out of order or API behaves unexpectedly
+        all_formatted_prices.sort(key=lambda x: x['timestamp'])
+        logging.info(f"Successfully fetched a total of {len(all_formatted_prices)} price points for product ID '{product_id}' from Coinbase Exchange API after processing all chunks.")
+    else:
+        logging.warning(f"No data fetched for product ID '{product_id}' from Coinbase Exchange API after attempting all chunks.")
+        
+    return all_formatted_prices
 
 def connect_to_mongodb():
     """
